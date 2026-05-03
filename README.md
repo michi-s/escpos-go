@@ -16,7 +16,6 @@ go get github.com/michi-s/escpos-go
 # replace github.com/michi-s/escpos-go => ../escpos
 ```
 
-
 ## Quick Start
 
 ```go
@@ -180,6 +179,36 @@ tmpl.Print(printer, order)
 
 **Built-in templates:** `DefaultGastroTemplate`, `MinimalTemplate`, `KitchenTemplate`
 
+### Preview (no printer needed)
+
+Preview receipts as PNG images or HTML pages before printing:
+
+```go
+tmpl, _ := escpos.NewTemplate("gastro", escpos.DefaultGastroTemplate)
+order := escpos.NewDemoOrder()
+
+// Save to files
+tmpl.SavePreviewPNG(order, "receipt.png", 48, 2)   // paperChars=48, scale=2
+tmpl.SavePreviewHTML(order, "receipt.html", 48)
+
+// Or get bytes/string for serving via HTTP
+pngBytes, _ := tmpl.PreviewPNG(order, 48, 2)
+htmlString, _ := tmpl.PreviewHTML(order, 48)
+```
+
+| Method | Description |
+|---|---|
+| `tmpl.PreviewPNG(order, paperChars, scale)` | Render to PNG `[]byte` |
+| `tmpl.PreviewHTML(order, paperChars)` | Render to HTML `string` |
+| `tmpl.SavePreviewPNG(order, path, paperChars, scale)` | Save PNG to file |
+| `tmpl.SavePreviewHTML(order, path, paperChars)` | Save HTML to file |
+
+Parameters:
+- `paperChars`: characters per line (48 for 80mm paper, 32 for 58mm)
+- `scale`: PNG resolution multiplier (1=basic, 2=recommended, 3=high-res)
+
+The HTML preview opens in any browser and looks like a thermal receipt. The PNG preview uses a monospace bitmap font and simulates text styling, sizes, alignment, cut lines, and placeholders for QR/barcodes.
+
 ## File Structure
 
 ```
@@ -188,7 +217,8 @@ escpos/
 ├── printer.go      # ESC/POS driver (Connect, GetStatus, PrintTest, all commands)
 ├── order.go        # Order, OrderItem, TaxRate, PaymentMethod
 ├── template.go     # ReceiptTemplate engine + built-in templates
+├── preview.go      # PNG and HTML preview rendering
 ├── example/
-│   └── main.go     # usage example
+│   └── main.go     # usage example (preview + print)
 └── README.md
 ```
