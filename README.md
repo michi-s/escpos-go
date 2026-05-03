@@ -1,3 +1,7 @@
+# Disclaimer
+
+This code was vibecoded with Claude. However it is tested with a MUNBYN ITPP072.
+
 # escpos — Go library for ESC/POS thermal receipt printers
 
 A zero-fuss Go library for talking to thermal receipt printers over TCP/LAN. Handles UTF-8 → codepage transcoding, text styling, images, barcodes, QR codes, paper cutting, cash drawer, and receipt templating.
@@ -6,13 +10,12 @@ A zero-fuss Go library for talking to thermal receipt printers over TCP/LAN. Han
 
 ```bash
 # In your project:
-go get github.com/user/escpos
+go get github.com/michi-s/escpos-go
 
 # Or use a local replace directive in your go.mod:
-# replace github.com/user/escpos => ../escpos
+# replace github.com/michi-s/escpos-go => ../escpos
 ```
 
-> **Note:** Replace `github.com/user/escpos` with your actual module path if you host it on GitHub or elsewhere.
 
 ## Quick Start
 
@@ -21,7 +24,7 @@ package main
 
 import (
     "log"
-    "github.com/user/escpos"
+    "github.com/michi-s/escpos-go"
 )
 
 func main() {
