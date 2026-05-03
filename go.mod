@@ -1,4 +1,4 @@
-module github.com/user/escpos
+module github.com/michi-s/escpos-go
 
 go 1.21
 

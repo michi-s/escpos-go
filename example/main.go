@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/user/escpos"
+	"github.com/michi-s/escpos-go"
 )
 
 func main() {
