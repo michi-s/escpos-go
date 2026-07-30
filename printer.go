@@ -15,9 +15,12 @@
 package escpos
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
+	"io"
 	"log"
 	"net"
 	"strings"
@@ -70,7 +73,8 @@ type PrinterStatus struct {
 	Online          bool
 	PaperOK         bool
 	CoverClosed     bool
-	ErrorState      bool
+	ErrorState      bool // any error bit from the DLE EOT 3 response (cutter, unrecoverable, or auto-recoverable)
+	CutterError     bool // specifically the auto-cutter/mechanical error bit — needs physical intervention
 	StatusSupported bool // true if the printer responded to status queries
 	RawPrinter      byte
 	RawOffline      byte
@@ -103,7 +107,9 @@ func (s PrinterStatus) String() string {
 	} else {
 		parts = append(parts, "COVER OPEN")
 	}
-	if s.ErrorState {
+	if s.CutterError {
+		parts = append(parts, "CUTTER ERROR")
+	} else if s.ErrorState {
 		parts = append(parts, "ERROR")
 	}
 	return strings.Join(parts, " | ")
@@ -123,22 +129,71 @@ type Printer struct {
 }
 
 // Connect opens a TCP connection to the thermal printer at the given
-// IP address and port (usually 9100).
+// IP address and port (usually 9100). A single dial attempt with a 5s
+// timeout — for a connection that retries through the "printer is still
+// busy with the previous job" window, use ConnectWithRetry.
+//
+// Connecting sends nothing to the printer — no ESC @ reset, no codepage
+// select. Sending ESC @ (a full reset: it can re-home the cutter and
+// re-read sensors) purely as a side effect of opening a connection caused
+// spurious transient status readings (e.g. a momentary false "cover open")
+// right after connecting/reconnecting, which is exactly the wrong time to
+// be misreading status if the caller is about to check it. Callers that
+// print via the high-level Text/Bold/etc. API (as opposed to writing a
+// pre-built byte stream, like NomNom does) should call Init and
+// SetCodePage themselves before printing — ReceiptTemplate.Print and
+// PrintTest already do.
 func Connect(ip string, port int) (*Printer, error) {
-	address := fmt.Sprintf("%s:%d", ip, port)
+	address := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
 	conn, err := net.DialTimeout("tcp", address, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("connect %s: %w", address, err)
 	}
-	p := &Printer{
+	return newPrinter(address, conn), nil
+}
+
+// ConnectWithRetry dials addr, retrying on a short interval as long as each
+// attempt fails with a timeout, up to maxWait total. Cheap ESC/POS network
+// printers only support one TCP connection at a time and keep refusing new
+// ones for as long as they're still physically executing the previous job
+// (feeding, cutting, kicking the drawer) — not a fixed "moment," it scales
+// with how much the previous job printed. Rather than guess one "long
+// enough" timeout, this keeps retrying on a short cadence up to maxWait, so
+// an already-idle printer still connects in milliseconds while a printer
+// that's genuinely still busy gets however much time it actually needs, up
+// to the ceiling. Only retries on a timeout specifically (not "connection
+// refused" etc.), since those usually mean something more persistent (wrong
+// IP, printer off) that retrying won't fix.
+func ConnectWithRetry(ip string, port int, maxWait time.Duration) (*Printer, error) {
+	const (
+		attemptTimeout = 800 * time.Millisecond
+		retryInterval  = 400 * time.Millisecond
+	)
+	address := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
+	deadline := time.Now().Add(maxWait)
+	for {
+		conn, err := net.DialTimeout("tcp", address, attemptTimeout)
+		if err == nil {
+			return newPrinter(address, conn), nil
+		}
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			return nil, fmt.Errorf("connect %s: %w", address, err)
+		}
+		if time.Now().Add(retryInterval).After(deadline) {
+			return nil, fmt.Errorf("connect %s: %w", address, err)
+		}
+		time.Sleep(retryInterval)
+	}
+}
+
+func newPrinter(address string, conn net.Conn) *Printer {
+	return &Printer{
 		address:    address,
 		conn:       conn,
 		codepage:   16,
 		paperWidth: 48,
 	}
-	p.Init()
-	p.SetCodePage(16)
-	return p, nil
 }
 
 // Close closes the printer connection.
@@ -168,6 +223,17 @@ func (p *Printer) Codepage() byte {
 // ---------------------------------------------------------------------------
 // Low-level I/O
 // ---------------------------------------------------------------------------
+
+// Write sends raw bytes straight to the printer's connection, satisfying
+// io.Writer. Unlike the styling/text helpers below (which silently drop
+// write errors — fine for a fire-and-forget script, useless for a caller
+// that needs to know a job actually went out), this is the primitive for
+// callers that assemble their own ESC/POS byte stream (e.g. NomNom's
+// receipt template renderer) and need a real error back to detect a dead
+// connection.
+func (p *Printer) Write(data []byte) (int, error) {
+	return p.conn.Write(data)
+}
 
 func (p *Printer) raw(data ...byte) {
 	p.conn.Write(data)
@@ -406,10 +472,11 @@ func (p *Printer) QRCode(data string, moduleSize byte, errorCorrection byte) {
 // Image printing (GS v 0 raster bit-image)
 // ---------------------------------------------------------------------------
 
-// PrintImage prints an image using the raster bit-image command.
-// The image is converted to 1-bit monochrome and scaled to maxWidthDots.
-// Use 384 for 80mm paper or 384 for 58mm paper.
-func (p *Printer) PrintImage(img image.Image, maxWidthDots int) {
+// RasterImageBytes converts an image to the ESC/POS raster bit-image command
+// sequence (GS v 0), without needing a live printer connection. Useful for
+// callers that assemble their own byte buffer for a transport other than
+// this package's built-in TCP dispatch (e.g. NomNom's USB/network dispatch).
+func RasterImageBytes(img image.Image, maxWidthDots int) []byte {
 	bounds := img.Bounds()
 	w := bounds.Dx()
 	h := bounds.Dy()
@@ -442,10 +509,19 @@ func (p *Printer) PrintImage(img image.Image, maxWidthDots int) {
 		}
 	}
 
-	p.raw(gs, 'v', '0', 0,
-		byte(byteWidth&0xFF), byte((byteWidth>>8)&0xFF),
-		byte(h&0xFF), byte((h>>8)&0xFF))
-	p.writeBytes(raster)
+	var buf bytes.Buffer
+	buf.Write([]byte{gs, 'v', '0', 0,
+		byte(byteWidth & 0xFF), byte((byteWidth >> 8) & 0xFF),
+		byte(h & 0xFF), byte((h >> 8) & 0xFF)})
+	buf.Write(raster)
+	return buf.Bytes()
+}
+
+// PrintImage prints an image using the raster bit-image command.
+// The image is converted to 1-bit monochrome and scaled to maxWidthDots.
+// Use 384 for 80mm paper or 384 for 58mm paper.
+func (p *Printer) PrintImage(img image.Image, maxWidthDots int) {
+	p.writeBytes(RasterImageBytes(img, maxWidthDots))
 }
 
 // ---------------------------------------------------------------------------
@@ -484,13 +560,6 @@ func (p *Printer) Beep(times, duration byte) {
 // Status queries
 // ---------------------------------------------------------------------------
 
-func (p *Printer) pingTCP() bool {
-	p.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	_, err := p.conn.Write([]byte{esc, '@'})
-	p.conn.SetWriteDeadline(time.Time{})
-	return err == nil
-}
-
 func (p *Printer) readWithTimeout(timeout time.Duration) (byte, error) {
 	buf := make([]byte, 1)
 	p.conn.SetReadDeadline(time.Now().Add(timeout))
@@ -509,45 +578,66 @@ func (p *Printer) drainInput() {
 	p.conn.SetReadDeadline(time.Time{})
 }
 
-func (p *Printer) queryDLEEOT(n byte) (byte, error) {
-	p.conn.Write([]byte{dle, 0x04, n})
-	return p.readWithTimeout(2 * time.Second)
+// query writes cmd and waits up to timeout for a one-byte reply. alive
+// distinguishes "connection is dead" from "connection is fine, printer just
+// didn't answer this particular query": a write failure or a read EOF (the
+// peer closed the connection) both mean dead (alive=false); a plain read
+// timeout means the connection is presumably still open but the printer
+// didn't reply — most commonly because it doesn't support that status
+// command. This distinction is what lets GetStatus double as the
+// connectivity probe without a separate ESC/POS command.
+func (p *Printer) query(cmd []byte, timeout time.Duration) (raw byte, alive bool, err error) {
+	if _, werr := p.conn.Write(cmd); werr != nil {
+		return 0, false, werr
+	}
+	b, rerr := p.readWithTimeout(timeout)
+	if rerr != nil {
+		if errors.Is(rerr, io.EOF) {
+			return 0, false, rerr
+		}
+		return 0, true, rerr
+	}
+	return b, true, nil
 }
 
-func (p *Printer) queryGSr(n byte) (byte, error) {
-	p.conn.Write([]byte{gs, 'r', n})
-	return p.readWithTimeout(2 * time.Second)
+func (p *Printer) queryDLEEOT(n byte) (raw byte, alive bool, err error) {
+	return p.query([]byte{dle, 0x04, n}, 2*time.Second)
 }
 
-// GetStatus queries the printer and returns a decoded PrinterStatus.
-// It checks TCP connectivity first, then tries DLE EOT (standard),
-// and falls back to GS r. If neither works, the printer is reported
-// as connected but without detailed status.
+func (p *Printer) queryGSr(n byte) (raw byte, alive bool, err error) {
+	return p.query([]byte{gs, 'r', n}, 2*time.Second)
+}
+
+// GetStatus queries the printer and returns a decoded PrinterStatus. It
+// tries DLE EOT (standard) first, falling back to GS r for printers that
+// don't support it. There's no separate connectivity ping — the first
+// query's write success/failure IS the connectivity check (see query).
+//
+// GetStatus never sends ESC @ or otherwise resets/reinitializes the
+// printer — status queries are read-only as far as the printer's physical
+// state is concerned. This matters because it's meant to be called
+// repeatedly (e.g. every few seconds by ManagedConn's background poll):
+// ESC @ is a full reset that can re-home the cutter and re-settle sensors,
+// and sending it right before (or as part of) a status check was
+// previously causing spurious transient readings — most visibly a false
+// "cover open" right after connecting, since the cover sensor hadn't
+// settled from the reset GetStatus itself had just triggered.
 func (p *Printer) GetStatus() PrinterStatus {
 	status := PrinterStatus{}
-
-	if !p.pingTCP() {
-		status.Connected = false
-		status.StatusErrors = append(status.StatusErrors, "TCP write failed — connection lost")
-		return status
-	}
-	status.Connected = true
-
 	p.drainInput()
 
-	// Try DLE EOT
-	dleSupported := false
-	raw1, err := p.queryDLEEOT(1)
+	raw1, alive, err := p.queryDLEEOT(1)
+	status.Connected = alive
+	if !alive {
+		status.StatusErrors = append(status.StatusErrors, "connection lost")
+		return status
+	}
 	if err == nil {
-		dleSupported = true
 		status.StatusSupported = true
 		status.RawPrinter = raw1
 		status.Online = (raw1 & 0x08) == 0
-	}
 
-	if dleSupported {
-		raw2, err := p.queryDLEEOT(2)
-		if err == nil {
+		if raw2, _, err2 := p.queryDLEEOT(2); err2 == nil {
 			status.RawOffline = raw2
 			status.CoverClosed = (raw2 & 0x04) == 0
 		} else {
@@ -555,16 +645,19 @@ func (p *Printer) GetStatus() PrinterStatus {
 			status.StatusErrors = append(status.StatusErrors, "offline status query timed out")
 		}
 
-		raw3, err := p.queryDLEEOT(3)
-		if err == nil {
+		// Error status (DLE EOT 3) bit layout per the Epson ESC/POS spec:
+		// bit2 (0x04) = auto-cutter/mechanical error, bit3 (0x08) =
+		// unrecoverable error, bit5 (0x20) = auto-recoverable error. Bit6
+		// (0x40, what this used to check) is fixed at 0 — it never fires.
+		if raw3, _, err3 := p.queryDLEEOT(3); err3 == nil {
 			status.RawError = raw3
-			status.ErrorState = (raw3 & 0x40) != 0
+			status.CutterError = (raw3 & 0x04) != 0
+			status.ErrorState = (raw3 & (0x04 | 0x08 | 0x20)) != 0
 		} else {
 			status.StatusErrors = append(status.StatusErrors, "error status query timed out")
 		}
 
-		raw4, err := p.queryDLEEOT(4)
-		if err == nil {
+		if raw4, _, err4 := p.queryDLEEOT(4); err4 == nil {
 			status.RawPaper = raw4
 			status.PaperOK = (raw4 & 0x60) == 0
 		} else {
@@ -575,28 +668,24 @@ func (p *Printer) GetStatus() PrinterStatus {
 		return status
 	}
 
-	// Fallback: GS r
+	// DLE EOT got no reply, but its write succeeded so the connection
+	// itself is alive — try the older GS r fallback before giving up on
+	// detailed status.
 	status.StatusErrors = append(status.StatusErrors, "DLE EOT not supported")
 
-	raw, err := p.queryGSr(1)
-	if err == nil {
+	raw, _, errGSr := p.queryGSr(1)
+	if errGSr == nil {
 		status.StatusSupported = true
 		status.RawPaper = raw
 		status.PaperOK = (raw & 0x03) == 0
 		status.StatusErrors = append(status.StatusErrors, "using GS r fallback")
-	}
-
-	if !status.StatusSupported {
+	} else {
 		status.StatusErrors = append(status.StatusErrors,
-			"GS r also not supported — printer does not support status queries")
+			"no response to any status query — printer may not support status reporting")
 		status.Online = true
 		status.PaperOK = true
 		status.CoverClosed = true
-		status.ErrorState = false
 	}
-
-	p.Init()
-	p.SetCodePage(p.codepage)
 
 	return status
 }
